@@ -1,4 +1,4 @@
-# Google & Zoom Meeting Notes Generator 🎙️📝
+# Google & Zoom Meeting Notes Generator 
 
 An automated system that records Google Meet and Zoom meetings and generates clean, timestamped meeting notes using OpenAI's Whisper speech-to-text model.
 
