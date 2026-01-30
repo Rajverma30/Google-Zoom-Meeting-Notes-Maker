@@ -1,0 +1,6 @@
+numpy
+pygetwindow
+sounddevice
+wavio
+openai-whisper
+imageio-ffmpeg

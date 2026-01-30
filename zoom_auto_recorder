@@ -1,0 +1,523 @@
+"""
+Zoom auto-recorder with VB-Audio Virtual Cable (system audio capture).
+
+Flow:
+1) Wait for Zoom meeting window (pygetwindow).
+2) Start recording system audio from VB-Audio Cable Output.
+3) Optional: also record microphone, mix to mono.
+4) Stop when meeting window disappears for a grace period.
+5) Save WAV (16k mono) + Whisper large-v3 transcription to TXT.
+
+Requirements:
+- Windows, VB-Audio Virtual Cable installed.
+- Zoom speaker set to: CABLE Input (VB-Audio Virtual Cable).
+"""
+
+import os
+import time
+import datetime
+from typing import Callable, List, Optional, Tuple
+
+import numpy as np
+import pygetwindow as gw
+import sounddevice as sd
+import wavio
+import whisper
+import msvcrt
+import shutil
+import re
+import sys
+
+# ================== CONFIG ==================
+FS = 16_000
+CHANNELS = 1
+MODEL_SIZE = "large-v3"  # Whisper model size
+LANGUAGE = "en"  # change to "hi" for Hinglish/Hindi, or None for auto-detect
+OUTPUT_DIR = "zoom_meetings"
+
+# Device selection
+VB_CABLE_KEYWORDS = ["cable output", "vb-audio"]  # searched in device name (lower)
+MIX_MIC = True               # True: mix mic + system audio; False: system audio only
+MIC_DEVICE_KEYWORDS = None   # e.g., ["microphone", "usb"] or None for default input
+
+# Meeting handling
+POLL_SEC = 1
+# Meeting handling
+POLL_SEC = 1
+# Start: when a Zoom meeting window appears.
+# Stop: when meeting window/tab is gone continuously for this many seconds.
+# User requested: 10 sec wait before auto stop.
+NO_MEETING_GRACE_SEC = 10
+# Don't allow auto-stop during the first few seconds (prevents immediate stop due to detection flicker)
+MIN_RECORDING_SEC_BEFORE_AUTOSTOP = 15
+
+# For browser meetings: tab change changes the window title, so title-based detection can "disappear".
+# If True, once a browser meeting (Google Meet / Zoom Web) starts, recording will NOT auto-stop
+# just because the title keyword disappeared. It will stop only when you press MANUAL_STOP_KEY,
+# or when the entire browser window is closed (no browser windows found).
+STICKY_BROWSER_MEETINGS = True
+
+# Manual override:
+# Press "p" anytime to stop recording + save + transcribe (if auto stop fails).
+MANUAL_STOP_KEY = "p"
+
+# Audio buffering
+BLOCK_DURATION_SEC = 0.5   # block size for callbacks
+# ============================================
+
+
+# -------- ffmpeg availability (required by whisper) --------
+def ensure_ffmpeg_available() -> None:
+    """
+    Whisper uses ffmpeg CLI to decode audio files.
+    On Windows, this often fails with WinError 2 if ffmpeg isn't installed / in PATH.
+
+    Strategy:
+    - If `ffmpeg` already exists in PATH, do nothing.
+    - Else try to provision a local `ffmpeg.exe` via `imageio-ffmpeg` (pip install imageio-ffmpeg).
+    - If neither works, raise a clear error with fix instructions.
+    """
+    if shutil.which("ffmpeg"):
+        return
+
+    try:
+        import imageio_ffmpeg  # type: ignore
+
+        ffmpeg_src = imageio_ffmpeg.get_ffmpeg_exe()
+        if not ffmpeg_src or not os.path.exists(ffmpeg_src):
+            raise RuntimeError("imageio-ffmpeg did not provide a valid ffmpeg executable.")
+
+        tools_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools", "ffmpeg")
+        os.makedirs(tools_dir, exist_ok=True)
+        ffmpeg_dst = os.path.join(tools_dir, "ffmpeg.exe")
+
+        # imageio-ffmpeg's binary name isn't always ffmpeg.exe; create a stable local copy name
+        if not os.path.exists(ffmpeg_dst):
+            shutil.copyfile(ffmpeg_src, ffmpeg_dst)
+
+        os.environ["PATH"] = tools_dir + os.pathsep + os.environ.get("PATH", "")
+        if shutil.which("ffmpeg"):
+            return
+    except Exception:
+        pass
+
+    raise RuntimeError(
+        "ffmpeg was not found, but Whisper requires it.\n\n"
+        "Fix (recommended):\n"
+        "  1) Activate your venv\n"
+        "  2) Run: pip install imageio-ffmpeg\n"
+        "  3) Re-run this script\n\n"
+        "Alternative: Install FFmpeg system-wide and ensure `ffmpeg` is in PATH."
+    )
+
+
+# -------- Device helpers --------
+def list_audio_devices() -> None:
+    """Print available audio devices for debugging."""
+    print("---- Available audio devices ----")
+    devices = sd.query_devices()
+    for idx, d in enumerate(devices):
+        print(f"[{idx}] {d['name']} (in:{d['max_input_channels']} out:{d['max_output_channels']})")
+    print("---- End of list ----")
+
+
+def _match_device(keywords: List[str], require_input: bool = True) -> Optional[int]:
+    """Return first device index whose name contains all keywords (case-insensitive)."""
+    devices = sd.query_devices()
+    for idx, d in enumerate(devices):
+        name = d["name"].lower()
+        if require_input and d["max_input_channels"] < 1:
+            continue
+        if all(k in name for k in keywords):
+            return idx
+    return None
+
+
+def find_vb_cable_device() -> int:
+    """Locate VB-Audio Cable output device; raise if not found."""
+    device_idx = _match_device([k.lower() for k in VB_CABLE_KEYWORDS], require_input=True)
+    if device_idx is None:
+        list_audio_devices()
+        raise RuntimeError(
+            "VB-Audio Cable input device not found. Ensure 'CABLE Output (VB-Audio Virtual Cable)' exists "
+            "and Zoom speaker is set to 'CABLE Input'."
+        )
+    return device_idx
+
+
+def find_mic_device() -> Optional[int]:
+    """Find mic device by keywords or use default input (None)."""
+    if MIC_DEVICE_KEYWORDS:
+        device_idx = _match_device([k.lower() for k in MIC_DEVICE_KEYWORDS], require_input=True)
+        if device_idx is None:
+            list_audio_devices()
+            raise RuntimeError("Microphone device with given keywords not found.")
+        return device_idx
+    return None  # None uses default input
+
+
+def _wasapi_loopback_setting(device_idx: int) -> Optional[sd.WasapiSettings]:
+    """Enable WASAPI loopback if the device host API is WASAPI (Windows)."""
+    info = sd.query_devices(device_idx)
+    hostapi_idx = info["hostapi"]
+    hostapi_name = sd.query_hostapis()[hostapi_idx]["name"].lower()
+    if "wasapi" in hostapi_name:
+        return sd.WasapiSettings(loopback=False)  # VB Cable is already capture side
+    return None
+
+
+# -------- Zoom detection (window-based only) --------
+def _strip_browser_suffix(title: str) -> str:
+    """
+    Remove common browser suffixes so we can show a clean meeting name.
+    Examples:
+      "Standup - Google Meet - Google Chrome" -> "Standup - Google Meet"
+      "meet.google.com/abc-defg-hij - Microsoft Edge" -> "meet.google.com/abc-defg-hij"
+    """
+    suffixes = [
+        " - Google Chrome",
+        " - Microsoft Edge",
+        " - Brave",
+        " - Mozilla Firefox",
+        " - Opera",
+        " - Vivaldi",
+        " - Safari",
+    ]
+    for s in suffixes:
+        if title.endswith(s):
+            return title[: -len(s)].strip()
+    return title.strip()
+
+
+def _normalize_meeting_name(title: str) -> str:
+    """
+    Convert a window/tab title into a filesystem-friendly meeting label.
+    """
+    t = _strip_browser_suffix(title)
+    t = re.sub(r"\s+", " ", t).strip()
+    # keep it readable but safe for Windows filenames
+    t = re.sub(r'[<>:"/\\\\|?*]', "_", t)
+    t = t.strip(" ._")
+    return t[:80] if len(t) > 80 else t
+
+
+def zoom_app_meeting_titles() -> List[str]:
+    """Detect the native Zoom meeting window."""
+    titles: List[str] = []
+    for title in gw.getAllTitles():
+        if not title:
+            continue
+        low = title.lower()
+        if "zoom meeting" in low:
+            titles.append(title)
+    return titles
+
+
+def google_meet_titles() -> List[str]:
+    """
+    Detect Google Meet in browsers using window/tab titles.
+    This is heuristic but works well in practice on Windows.
+    """
+    titles: List[str] = []
+    for title in gw.getAllTitles():
+        if not title:
+            continue
+        low = title.lower()
+        if "meet.google.com" in low or "google meet" in low:
+            titles.append(title)
+    return titles
+
+
+def google_meet_active_titles() -> List[str]:
+    """
+    User rule:
+    - When NOT in a meeting, the tab often just shows "Google Meet".
+    - When IN a meeting, the title shows: "Meet - <something>" (the "<something>" differs per PC).
+
+    So we treat a Meet meeting as active ONLY if the window/tab title contains "meet -"
+    (case-insensitive), with anything after it.
+    """
+    titles: List[str] = []
+    meet_incall = re.compile(r"\bmeet\s*-\s*.+", re.IGNORECASE)
+    for title in gw.getAllTitles():
+        if not title:
+            continue
+        # strip browser suffix for matching; suffix varies by browser
+        base = _strip_browser_suffix(title)
+        base_low = base.lower()
+        # Ignore Google Search result pages like "Google Meet - Google Search"
+        if "google search" in base_low:
+            continue
+        if meet_incall.search(base):
+            titles.append(title)
+    return titles
+
+
+def zoom_web_titles() -> List[str]:
+    """Detect Zoom meetings running in a browser tab/window."""
+    titles: List[str] = []
+    for title in gw.getAllTitles():
+        if not title:
+            continue
+        low = title.lower()
+        if "zoom.us" in low or "zoom meeting" in low:
+            # include browser tabs too (Zoom web client often shows these)
+            titles.append(title)
+    return titles
+
+
+def any_browser_window_open() -> bool:
+    """Return True if any common browser window is open (regardless of active tab)."""
+    browser_markers = [
+        " - google chrome",
+        " - microsoft edge",
+        " - brave",
+        " - mozilla firefox",
+        " - opera",
+        " - vivaldi",
+        " - safari",
+    ]
+    for title in gw.getAllTitles():
+        if not title:
+            continue
+        low = title.lower()
+        if any(low.endswith(m) for m in browser_markers):
+            return True
+    return False
+
+
+def is_browser_meeting_title(title: str) -> bool:
+    low = title.lower()
+    # "google meet" can appear on landing/search pages; prefer URL-based checks
+    return ("meet.google.com" in low) or ("zoom.us" in low)
+
+
+def meeting_titles_any() -> List[str]:
+    """Detect any supported meeting windows/tabs (Zoom app + browser meetings)."""
+    titles = []
+    titles.extend(zoom_app_meeting_titles())
+    # Only treat active Meet meeting pages as "meeting"
+    titles.extend(google_meet_active_titles())
+    titles.extend(zoom_web_titles())
+    # De-duplicate while preserving order
+    seen = set()
+    out = []
+    for t in titles:
+        if t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+    return out
+
+
+def is_any_meeting_open() -> bool:
+    return bool(meeting_titles_any())
+
+
+# -------- Manual key handling (Windows console) --------
+def manual_stop_pressed() -> bool:
+    """
+    Non-blocking check for manual stop key.
+    Uses msvcrt so it works in a normal Windows terminal/console.
+    """
+    try:
+        while msvcrt.kbhit():
+            ch = msvcrt.getch()
+            try:
+                key = ch.decode("utf-8", errors="ignore").lower()
+            except Exception:
+                key = ""
+            if key == MANUAL_STOP_KEY.lower():
+                return True
+        return False
+    except Exception:
+        # If the terminal doesn't support key polling, just disable manual stop.
+        return False
+
+
+# -------- Recording helpers --------
+def build_stream(
+    device: Optional[int],
+    frames_store: List[np.ndarray],
+    name: str,
+    loopback: bool = False,
+) -> sd.InputStream:
+    """Create a configured InputStream."""
+    extra = None
+    if loopback:
+        extra = sd.WasapiSettings(loopback=True)
+    else:
+        extra = _wasapi_loopback_setting(device) if device is not None else None
+
+    return sd.InputStream(
+        device=device,
+        samplerate=FS,
+        channels=CHANNELS,
+        blocksize=int(BLOCK_DURATION_SEC * FS),
+        dtype="float32",
+        callback=lambda indata, frames, time_info, status: _frame_cb(
+            indata, status, frames_store, name
+        ),
+        extra_settings=extra,
+    )
+
+
+def _frame_cb(indata, status, store: List[np.ndarray], name: str) -> None:
+    if status:
+        print(f"[{name}] {status}")
+    store.append(indata.copy())
+
+
+def mix_or_pick(system_audio: Optional[np.ndarray], mic_audio: Optional[np.ndarray]) -> np.ndarray:
+    """Mix mic with system or return available track; always mono float32."""
+    if system_audio is None and mic_audio is None:
+        return np.array([], dtype=np.float32)
+    if not MIX_MIC:
+        return system_audio if system_audio is not None else mic_audio
+
+    if system_audio is None:
+        return mic_audio
+    if mic_audio is None:
+        return system_audio
+
+    # Pad shorter to match length
+    max_len = max(len(system_audio), len(mic_audio))
+    def _pad(x): return np.pad(x, ((0, max_len - len(x)), (0, 0)), mode="constant")
+    sys_p = _pad(system_audio)
+    mic_p = _pad(mic_audio)
+    mixed = (sys_p + mic_p) * 0.5
+    return mixed.astype(np.float32)
+
+
+def concat_frames(frames: List[np.ndarray]) -> Optional[np.ndarray]:
+    if not frames:
+        return None
+    return np.concatenate(frames, axis=0)
+
+
+def ensure_output_dir() -> None:
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+# -------- Main flow --------
+def main() -> None:
+    # Avoid UnicodeEncodeError in some Windows consoles (cp1252)
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+    print("---- Zoom Auto Recorder (VB-Audio Cable) ----")
+    ensure_ffmpeg_available()
+    list_audio_devices()
+
+    while True:
+        # Wait for meeting window to appear
+        print("Waiting for meeting (Zoom / Google Meet / Zoom Web)...")
+        while not is_any_meeting_open():
+            time.sleep(POLL_SEC)
+
+        detected_titles = meeting_titles_any()
+        clean_names = [_strip_browser_suffix(t) for t in detected_titles]
+        print(f"Meeting detected with titles: {clean_names}")
+        started_from_browser = any(is_browser_meeting_title(t) for t in detected_titles)
+        started_from_google_meet = any(re.search(r"\bmeet\s*-\s*.+", _strip_browser_suffix(t), re.IGNORECASE) for t in detected_titles)
+
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        ensure_output_dir()
+        meeting_label = _normalize_meeting_name(clean_names[0]) if clean_names else "meeting"
+        audio_path = os.path.join(OUTPUT_DIR, f"{meeting_label}_{timestamp}.wav")
+        text_path = os.path.join(OUTPUT_DIR, f"{meeting_label}_{timestamp}.txt")
+
+        # Resolve devices
+        system_device = find_vb_cable_device()
+        mic_device = find_mic_device() if MIX_MIC else None
+
+        print(f"Meeting detected! Recording started...\n"
+              f"   Audio: {audio_path}\n   Text : {text_path}\n"
+              f"   System device: {system_device}, Mic: {mic_device if MIX_MIC else 'disabled'}")
+        print(f"Manual stop: press '{MANUAL_STOP_KEY}' to stop recording anytime.")
+
+        sys_frames: List[np.ndarray] = []
+        mic_frames: List[np.ndarray] = []
+
+        streams = []
+        streams.append(build_stream(system_device, sys_frames, "system", loopback=False))
+        if MIX_MIC:
+            streams.append(build_stream(mic_device, mic_frames, "mic", loopback=False))
+
+        for s in streams:
+            s.start()
+
+        record_start_ts = time.time()
+        no_meeting_secs = 0
+        try:
+            while True:
+                if manual_stop_pressed():
+                    print("Manual stop pressed. Stopping...")
+                    break
+
+                meeting_visible_now = is_any_meeting_open()
+                # Sticky mode for browser meetings: ignore title keyword disappearing when user changes tabs.
+                # Only stop if browser windows themselves are gone (user closed browser) OR manual stop.
+                if STICKY_BROWSER_MEETINGS and started_from_browser:
+                    # Google Meet: stop if "Meet - ..." is not visible for > NO_MEETING_GRACE_SEC
+                    if started_from_google_meet:
+                        if google_meet_active_titles():
+                            no_meeting_secs = 0
+                        else:
+                            no_meeting_secs += POLL_SEC
+                    elif not any_browser_window_open():
+                        no_meeting_secs += POLL_SEC
+                    else:
+                        no_meeting_secs = 0
+                elif meeting_visible_now:
+                    no_meeting_secs = 0
+                else:
+                    no_meeting_secs += POLL_SEC
+
+                can_autostop = (time.time() - record_start_ts) >= MIN_RECORDING_SEC_BEFORE_AUTOSTOP
+                if can_autostop and no_meeting_secs >= NO_MEETING_GRACE_SEC:
+                    print("Meeting window gone. Stopping recording...")
+                    break
+
+                time.sleep(POLL_SEC)
+        finally:
+            for s in streams:
+                s.stop()
+                s.close()
+
+        system_audio = concat_frames(sys_frames)
+        mic_audio = concat_frames(mic_frames) if MIX_MIC else None
+        final_audio = mix_or_pick(system_audio, mic_audio)
+
+        if final_audio.size == 0:
+            print("No audio captured; skipping transcription.")
+        else:
+            wavio.write(audio_path, final_audio, FS, sampwidth=2)
+            print(f"Audio saved as {audio_path}")
+
+            print("Loading Whisper model...")
+            model = whisper.load_model(MODEL_SIZE)
+
+            print("Transcribing...")
+            result = model.transcribe(
+                audio_path,
+                language=LANGUAGE,
+                task="transcribe",
+                temperature=0.0,
+                beam_size=5,
+                best_of=5,
+                verbose=False,
+            )
+
+            with open(text_path, "w", encoding="utf-8") as f:
+                f.write(result.get("text", ""))
+
+            print(f"Transcription saved as {text_path}")
+
+        print("Recorder idle. It will auto-start on the next meeting window/tab.")
+
+
+if __name__ == "__main__":
+    main()
